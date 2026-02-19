@@ -1,0 +1,301 @@
+"""Clean, stable GUI for qubo with a language switcher (Python / OpenQASM).
+This file implements a compact MainWindow, an editor with line numbers, and a MultiLanguageHighlighter.
+"""
+from __future__ import annotations
+import sys, os, io, traceback, math
+from typing import Dict
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QListWidget, QPlainTextEdit, QTabWidget, QComboBox, QSpinBox, QDockWidget, QTextEdit
+)
+from PyQt5.QtCore import Qt, QRect, QSize
+from PyQt5.QtGui import QFont, QColor, QPainter, QTextFormat, QSyntaxHighlighter, QTextCharFormat
+
+import numpy as np
+import matplotlib
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+from .circuit import QuantumCircuit
+from .simulator import StatevectorSimulator
+from . import noise as noise_mod
+from .ai import suggest_corrections
+
+STYLE = """
+QWidget { background-color: #120022; color: #e6d6ff; }
+QPlainTextEdit { background-color: #0f001b; color: #e6d6ff; border: 1px solid #2b003b; }
+QLabel { color: #e6d6ff; }
+QListWidget { background-color: #160028; color: #e6d6ff; border: 1px solid #2b003b; }
+QPushButton { background-color: #220033; color: #e6d6ff; border: 1px solid #3a0050; padding: 6px; }
+QPushButton:hover { background-color: #3a0050; }
+QTabWidget::pane { background: #14001f; }
+QTabBar::tab { background: #1a0028; color: #d9c8ff; padding: 6px; }
+QTabBar::tab:selected { background: #2b0040; }
+QSplitter { background: #120022; }
+"""
+
+# ---- Line number & highlighter helpers ----
+class LineNumberArea(QWidget):
+    def __init__(self, editor:'CodeEditor'):
+        super().__init__(editor)
+        self._editor = editor
+    def sizeHint(self):
+        return QSize(self._editor.line_number_area_width(), 0)
+    def paintEvent(self, event):
+        self._editor.paint_line_numbers(event)
+
+class PythonHighlighter(QSyntaxHighlighter):
+    KEYWORDS = ['False','class','finally','is','return','None','continue','for','lambda','try','True','def','from','nonlocal','while','and','del','global','not','with','as','elif','if','or','yield','assert','else','import','pass','break','except','in','raise']
+    def __init__(self, doc):
+        super().__init__(doc); self._f={}; self._init()
+    def _fmt(self,color,style=''):
+        fmt=QTextCharFormat(); fmt.setForeground(QColor(color))
+        if 'bold' in style: fmt.setFontWeight(QFont.Bold)
+        if 'italic' in style: fmt.setFontItalic(True)
+        return fmt
+    def _init(self):
+        self._f['kw']=self._fmt('#d8b4ff','bold')
+        self._f['str']=self._fmt('#ffcbff')
+        self._f['com']=self._fmt('#6d5a88','italic')
+        self._f['defn']=self._fmt('#b892ff','bold')
+        self._f['cls']=self._fmt('#b892ff','bold')
+        self._f['num']=self._fmt('#d0a8ff')
+    def highlightBlock(self,text):
+        import re
+        work=text
+        if '#' in text:
+            i=text.find('#'); self.setFormat(i,len(text)-i,self._f['com']); work=text[:i]
+        for m in re.finditer(r'("[^"]*"|\'[^\']*\')',work):
+            self.setFormat(m.start(),m.end()-m.start(),self._f['str'])
+        for m in re.finditer(r'\b[0-9]+(\.[0-9]+)?\b',work):
+            self.setFormat(m.start(),m.end()-m.start(),self._f['num'])
+        for kw in self.KEYWORDS:
+            if kw in ('def','class'): continue
+            for m in re.finditer(rf'\b{kw}\b',work):
+                self.setFormat(m.start(),m.end()-m.start(),self._f['kw'])
+        for m in re.finditer(r'\bdef\s+(\w+)',work):
+            name=m.group(1); self.setFormat(m.start(),3,self._f['kw']); self.setFormat(m.start()+4,len(name),self._f['defn'])
+        for m in re.finditer(r'\bclass\s+(\w+)',work):
+            name=m.group(1); self.setFormat(m.start(),5,self._f['kw']); self.setFormat(m.start()+6,len(name),self._f['cls'])
+
+class MultiLanguageHighlighter(QSyntaxHighlighter):
+    KEYWORDS = {
+        'python': PythonHighlighter.KEYWORDS,
+        'openqasm': ['OPENQASM','include','qreg','creg','gate','measure','if','opaque','u','cx','barrier','reset'],
+    }
+    COMMENT_TOKEN = {'python': '#', 'openqasm': '//'}
+    def __init__(self, document, lang='python'):
+        super().__init__(document)
+        self.lang = (lang or 'python').lower(); self._formats = {}; self._define_formats()
+    def _format(self,color,style=''):
+        fmt=QTextCharFormat(); fmt.setForeground(QColor(color))
+        if 'bold' in style: fmt.setFontWeight(QFont.Bold)
+        if 'italic' in style: fmt.setFontItalic(True)
+        return fmt
+    def _define_formats(self):
+        self._formats['keyword']=self._format('#d8b4ff','bold')
+        self._formats['string']=self._format('#ffcbff')
+        self._formats['comment']=self._format('#6d5a88','italic')
+        self._formats['number']=self._format('#d0a8ff')
+    def set_language(self, lang: str):
+        self.lang = (lang or 'python').lower(); self.rehighlight()
+    def highlightBlock(self, text: str):
+        import re
+        comment_tok = self.COMMENT_TOKEN.get(self.lang, '#')
+        if comment_tok and comment_tok in text:
+            idx = text.find(comment_tok)
+            self.setFormat(idx, len(text) - idx, self._formats['comment'])
+            text_wo_comment = text[:idx]
+        else:
+            text_wo_comment = text
+        for match in re.finditer(r'("[^"]*"|\'[^\']*\')', text_wo_comment):
+            self.setFormat(match.start(), match.end() - match.start(), self._formats['string'])
+        for m in re.finditer(r'\b[0-9]+(\.[0-9]+)?\b', text_wo_comment):
+            self.setFormat(m.start(), m.end() - m.start(), self._formats['number'])
+        kws = self.KEYWORDS.get(self.lang, [])
+        for kw in kws:
+            for m in re.finditer(rf'\b{kw}\b', text_wo_comment, flags=re.IGNORECASE if self.lang=='openqasm' else 0):
+                self.setFormat(m.start(), m.end() - m.start(), self._formats['keyword'])
+
+class CodeEditor(QPlainTextEdit):
+    def __init__(self):
+        super().__init__(); self.setFont(QFont('Consolas',11))
+        self.setPlainText("from qubo.circuit import QuantumCircuit\n\nqc = QuantumCircuit(2)\nqc.add_gate('H', targets=[0])\nqc.add_gate('X', targets=[1])\nqc.add_gate('M', targets=[0,1])\n")
+        self._ln = LineNumberArea(self)
+        self.blockCountChanged.connect(self._update_margin)
+        self.updateRequest.connect(self._update_area)
+        self.cursorPositionChanged.connect(self._highlight_line)
+        self._highlighter = MultiLanguageHighlighter(self.document(), 'python')
+        self._update_margin(0); self._highlight_line()
+    def set_language(self, lang: str):
+        lang = (lang or 'python').lower()
+        try:
+            self._highlighter.set_language(lang)
+        except Exception:
+            self._highlighter = MultiLanguageHighlighter(self.document(), lang)
+        self._highlighter.rehighlight()
+    def line_number_area_width(self):
+        digits=len(str(max(1,self.blockCount()))); return 10 + self.fontMetrics().width('9')*digits
+    def _update_margin(self,_): self.setViewportMargins(self.line_number_area_width(),0,0,0)
+    def resizeEvent(self,e):  # type: ignore
+        super().resizeEvent(e); cr=self.contentsRect(); self._ln.setGeometry(QRect(cr.left(),cr.top(),self.line_number_area_width(),cr.height()))
+    def _update_area(self,rect,dy):  # type: ignore
+        if dy: self._ln.scroll(0,dy)
+        else: self._ln.update(0,rect.y(),self._ln.width(),rect.height())
+        if rect.contains(self.viewport().rect()): self._update_margin(0)
+    def paint_line_numbers(self,event):
+        p=QPainter(self._ln); p.fillRect(event.rect(),QColor('#1c0d29'))
+        block=self.firstVisibleBlock(); num=block.blockNumber(); top=int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom=top+int(self.blockBoundingRect(block).height()); cur=self.textCursor().blockNumber()
+        while block.isValid() and top<=event.rect().bottom():
+            if block.isVisible() and bottom>=event.rect().top():
+                p.setPen(QColor('#b892ff') if num==cur else QColor('#6d5a88'))
+                p.drawText(0,top,self._ln.width()-4,self.fontMetrics().height(),Qt.AlignRight,str(num+1))
+            block=block.next(); num+=1; top=bottom; bottom=top+int(self.blockBoundingRect(block).height())
+    def _highlight_line(self):
+        if self.isReadOnly(): self.setExtraSelections([]); return
+        from PyQt5.QtWidgets import QTextEdit
+        sel = QTextEdit.ExtraSelection()  # type: ignore
+        col=QColor('#2b0040'); sel.format.setBackground(col); sel.format.setProperty(QTextFormat.FullWidthSelection,True)
+        sel.cursor=self.textCursor(); sel.cursor.clearSelection(); self.setExtraSelections([sel])
+
+class MplCanvas(FigureCanvas):
+    def __init__(self):
+        self.fig=Figure(figsize=(5,3)); self.ax=self.fig.add_subplot(111); super().__init__(self.fig)
+    def plot_state(self,state:np.ndarray):
+        self.ax.clear(); probs=(np.abs(state)**2).real; n=int(math.log2(len(probs))) if len(probs)>0 else 0
+        labels=[format(i,f'0{n}b') for i in range(len(probs))]
+        self.ax.bar(labels,probs,color='#b892ff'); self.ax.set_ylabel('Probability'); self.ax.set_title('Statevector'); self.fig.tight_layout(); self.draw()
+    def plot_counts(self,counts:Dict[str,int]):
+        self.ax.clear(); labels=list(counts.keys()); vals=[counts[k] for k in labels]
+        self.ax.bar(labels,vals,color='#b892ff'); self.ax.set_ylabel('Counts'); self.ax.set_title('Measurements'); self.fig.tight_layout(); self.draw()
+
+NOISE = {
+    'None': None,
+    'Bit-flip': noise_mod.bit_flip,
+    'Phase-flip': noise_mod.phase_flip,
+    'Depolarizing': noise_mod.depolarizing,
+    'Amplitude Damping': noise_mod.amplitude_damping,
+}
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__(); self.setWindowTitle('qubo — Quantum IDE'); self.resize(1100,700)
+        self.setStyleSheet(STYLE)
+        root = QWidget(); layout = QHBoxLayout(root); self.setCentralWidget(root)
+
+        # Left side: gates + preview
+        left = QVBoxLayout(); left_widget = QWidget(); left_widget.setLayout(left); layout.addWidget(left_widget,1)
+        left.addWidget(QLabel('Gates'))
+        self.gate_list = QListWidget(); [self.gate_list.addItem(g) for g in ['H','X','RX','RY','RZ','CNOT','SWAP','M']]
+        left.addWidget(self.gate_list)
+        left.addWidget(QLabel('Circuit Preview'))
+        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); left.addWidget(self.preview,1)
+
+        # Right side: editor + controls + tabs
+        right_box = QVBoxLayout(); right_widget = QWidget(); right_widget.setLayout(right_box); layout.addWidget(right_widget,2)
+        toolbar = QHBoxLayout(); right_box.addLayout(toolbar)
+        self.run_btn = QPushButton('Run'); self.ai_btn = QPushButton('AI')
+        toolbar.addWidget(QLabel('Shots:'))
+        self.shots_spin = QSpinBox(); self.shots_spin.setRange(1,100000); self.shots_spin.setValue(512); toolbar.addWidget(self.shots_spin)
+        toolbar.addWidget(QLabel('Noise:'))
+        self.noise_combo = QComboBox(); self.noise_combo.addItems(list(NOISE.keys())); toolbar.addWidget(self.noise_combo)
+        # Language selector for syntax highlighting (Python, OpenQASM)
+        toolbar.addWidget(QLabel('Language:'))
+        self.lang_combo = QComboBox(); self.lang_combo.addItems(['Python','OpenQASM']); toolbar.addWidget(self.lang_combo)
+        toolbar.addWidget(self.run_btn); toolbar.addWidget(self.ai_btn)
+
+        self.editor = CodeEditor(); right_box.addWidget(self.editor,3)
+        # wire language selector
+        self.lang_combo.currentTextChanged.connect(lambda t: self.editor.set_language(t))
+
+        self.tabs = QTabWidget(); right_box.addWidget(self.tabs,3)
+        self.output_panel = QPlainTextEdit(); self.output_panel.setReadOnly(True)
+        self.sim_panel = QPlainTextEdit(); self.sim_panel.setReadOnly(True)
+        self.canvas = MplCanvas()
+        self.noise_info = QPlainTextEdit(); self.noise_info.setReadOnly(True)
+        self.tabs.addTab(self.output_panel,'Output')
+        self.tabs.addTab(self.sim_panel,'Simulator')
+        self.tabs.addTab(self.canvas,'Visualizer')
+        self.tabs.addTab(self.noise_info,'Noise')
+
+        self.gate_list.itemDoubleClicked.connect(self._insert_gate)
+        self.run_btn.clicked.connect(self._run)
+        self.ai_btn.clicked.connect(self._ai)
+        self.editor.textChanged.connect(self._update_preview)
+
+        if not os.getenv('QUBO_SKIP_AI_DOCK'):
+            self._init_ai_dock()
+        self._update_preview()
+
+    # --- AI Dock ---
+    def _init_ai_dock(self):
+        dock = QDockWidget('AI Suggestions', self)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        w = QWidget(); lay = QVBoxLayout(w)
+        self.ai_text = QTextEdit(); self.ai_text.setReadOnly(True)
+        btn = QPushButton('Analyze Code'); btn.clicked.connect(self._ai)
+        lay.addWidget(btn); lay.addWidget(self.ai_text)
+        dock.setWidget(w)
+
+    def _ai(self):
+        code = self.editor.toPlainText()
+        try:
+            suggestions = suggest_corrections(code)
+        except Exception as e:
+            suggestions = f"AI error: {e}"
+        self.ai_text.setPlainText(suggestions)
+        self.output_panel.appendPlainText('[AI]\n'+suggestions)
+
+    # --- Gate insertion / preview ---
+    def _insert_gate(self,item):
+        g=item.text(); cur=self.editor.textCursor()
+        if g in {'H','X'}: cur.insertText(f"qc.add_gate('{g}', targets=[0])\n")
+        elif g in {'RX','RY','RZ'}: cur.insertText(f"qc.add_gate('{g}', targets=[0], params=[0.5])\n")
+        elif g=='CNOT': cur.insertText("qc.add_gate('CNOT', targets=[0,1])\n")
+        elif g=='SWAP': cur.insertText("qc.add_gate('SWAP', targets=[0,1])\n")
+        elif g=='M': cur.insertText("qc.add_gate('M', targets=[0,1])\n")
+    def _update_preview(self):
+        code=self.editor.toPlainText(); lines=[l.strip() for l in code.splitlines() if 'add_gate' in l or 'QuantumCircuit' in l]
+        self.preview.setPlainText('\n'.join(lines) if lines else '(no gates)')
+
+    # --- Noise hook builder ---
+    def _noise_hook(self):
+        name=self.noise_combo.currentText(); func=NOISE.get(name)
+        if not func: return None
+        def hook(state, gate):
+            for t in gate.targets:
+                try: return func(state,0.05,t)
+                except Exception: return state
+            return state
+        return hook
+
+    # --- Run ---
+    def _run(self):
+        code=self.editor.toPlainText(); ns={}
+        try:
+            exec(code, ns)
+        except Exception:
+            self.output_panel.appendPlainText('Execution error:\n'+traceback.format_exc())
+            return
+        qc=ns.get('qc')
+        if not isinstance(qc, QuantumCircuit):
+            self.output_panel.appendPlainText("No QuantumCircuit 'qc' defined.")
+            return
+        shots=int(self.shots_spin.value()); sim=StatevectorSimulator(qc, noise_hook=self._noise_hook())
+        res=sim.run(shots=shots)
+        if isinstance(res, dict):
+            self.sim_panel.setPlainText(str(res))
+            self.canvas.plot_counts(res)
+        else:
+            self.sim_panel.setPlainText(np.array2string(res, precision=3))
+            self.canvas.plot_state(res)
+        self.noise_info.setPlainText(f"Noise: {self.noise_combo.currentText()} p=0.05")
+        self.output_panel.appendPlainText(repr(qc))
+
+# ---- Entry ----
+if __name__ == '__main__':  # pragma: no cover
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec_())

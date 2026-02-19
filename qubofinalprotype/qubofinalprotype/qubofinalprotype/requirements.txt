@@ -1,0 +1,6 @@
+numpy
+matplotlib
+pytest
+click
+PyQt5
+google-generativeai  # Optional: needed for Gemini AI chat & suggestions

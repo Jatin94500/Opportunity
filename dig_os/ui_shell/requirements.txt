@@ -1,0 +1,5 @@
+PySide6==6.8.0.2
+requests==2.32.3
+py-algorand-sdk==2.11.1
+# Optional: install notebook to enable embedded Jupyter server
+# notebook==7.4.5

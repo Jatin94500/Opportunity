@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+ai_worker/build/
+ai_worker/dig_worker/native/metrics.c
+ai_worker/dig_worker/native/*.so
+ai_worker/dig_worker/native/*.pyd
+ai_worker/checkpoints/*
+!ai_worker/checkpoints/.gitkeep
+
