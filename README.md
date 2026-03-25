@@ -1,6 +1,6 @@
 # NuroChain Opportunity OS
 # Made by Team Star Busters 
-# WEb3 Winner Harsh Prajapati and Jatin pandey
+# Harsh Prajapati and Jatin pandey
 
 NuroChain Opportunity OS is a desktop shell + AI compute demo stack that combines:
 
